@@ -52,6 +52,8 @@ typedef struct TimerNode {
 static HANDLE s_timerMainThread = NULL;
 static HANDLE s_timerThread = NULL;
 static int s_timerTime;
+static CRITICAL_SECTION s_timerCriticalSection;
+static volatile LONG s_timerMissedInterrupts;
 #elif !defined(TOS) && !defined(DOS)
 static struct itimerval s_timerTime;
 #endif /* _WIN32 */
@@ -185,13 +187,23 @@ void CALLBACK Timer_InterruptWindows(LPVOID arg, BOOLEAN TimerOrWaitFired) {
 	VARIABLE_NOT_USED(arg);
 	VARIABLE_NOT_USED(TimerOrWaitFired);
 
-	SuspendThread(s_timerMainThread);
+	if (!TryEnterCriticalSection(&s_timerCriticalSection)) {
+		InterlockedIncrement(&s_timerMissedInterrupts);
+		return;
+	}
+	DWORD ret = SuspendThread(s_timerMainThread);
+	if (ret == (DWORD)-1) {
+		LeaveCriticalSection(&s_timerCriticalSection);
+		InterlockedIncrement(&s_timerMissedInterrupts);
+		return;
+	}
 #if defined(WITH_SDL) || defined(WITH_SDL2)
 	s_timer_count++;
 #else
 	Timer_InterruptRun(0);
 #endif /* defined(WITH_SDL) || defined(WITH_SDL2) */
 	ResumeThread(s_timerMainThread);
+	LeaveCriticalSection(&s_timerCriticalSection);
 }
 #endif /* _WIN32 */
 
@@ -203,8 +215,10 @@ void CALLBACK Timer_InterruptWindows(LPVOID arg, BOOLEAN TimerOrWaitFired) {
 static void Timer_InterruptSuspend(void)
 {
 #if defined(_WIN32)
+	EnterCriticalSection(&s_timerCriticalSection);
 	if (s_timerThread != NULL) DeleteTimerQueueTimer(NULL, s_timerThread, NULL);
 	s_timerThread = NULL;
+	LeaveCriticalSection(&s_timerCriticalSection);
 #else
 	setitimer(ITIMER_REAL, NULL, NULL);
 #endif /* _WIN32 */
@@ -216,7 +230,9 @@ static void Timer_InterruptSuspend(void)
 static void Timer_InterruptResume(void)
 {
 #if defined(_WIN32)
-	CreateTimerQueueTimer(&s_timerThread, NULL, Timer_InterruptWindows, NULL, s_timerTime, s_timerTime, WT_EXECUTEINTIMERTHREAD);
+	EnterCriticalSection(&s_timerCriticalSection);
+	CreateTimerQueueTimer(&s_timerThread, NULL, Timer_InterruptWindows, NULL, s_timerTime, s_timerTime, WT_EXECUTEDEFAULT);
+	LeaveCriticalSection(&s_timerCriticalSection);
 #else
 	setitimer(ITIMER_REAL, &s_timerTime, NULL);
 #endif /* _WIN32 */
@@ -234,6 +250,7 @@ void Timer_Init(void)
 #if defined(_WIN32)
 	s_timerTime = s_timerSpeed / 1000;
 	DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &s_timerMainThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
+	InitializeCriticalSection(&s_timerCriticalSection);
 #elif defined(TOS)
 	(void)Cconws("Timer_Init()\r\n");
 	/* see http://toshyp.atari.org/en/004009.html#Xbtimer */
@@ -273,6 +290,7 @@ void Timer_Uninit(void)
 #endif /* !defined(TOS) && !defined(DOS) */
 #if defined(_WIN32)
 	CloseHandle(s_timerMainThread);
+	DeleteCriticalSection(&s_timerCriticalSection);
 #endif /* _WIN32 */
 
 	free(s_timerNodes); s_timerNodes = NULL;
@@ -287,6 +305,9 @@ void Timer_Uninit(void)
  */
 void Timer_Add(void (*callback)(void), uint32 usec_delay, bool callonce)
 {
+#if defined(_WIN32)
+	EnterCriticalSection(&s_timerCriticalSection);
+#endif
 	TimerNode *node;
 	if (s_timerNodeCount == s_timerNodeSize) {
 		s_timerNodeSize += 2;
@@ -298,6 +319,9 @@ void Timer_Add(void (*callback)(void), uint32 usec_delay, bool callonce)
 	node->usec_delay = usec_delay;
 	node->callback   = callback;
 	node->callonce   = callonce;
+#if defined(_WIN32)
+	LeaveCriticalSection(&s_timerCriticalSection);
+#endif
 }
 
 /**
@@ -307,6 +331,9 @@ void Timer_Add(void (*callback)(void), uint32 usec_delay, bool callonce)
  */
 void Timer_Change(void (*callback)(void), uint32 usec_delay)
 {
+#if defined(_WIN32)
+	EnterCriticalSection(&s_timerCriticalSection);
+#endif
 	int i;
 	TimerNode *node = s_timerNodes;
 	for (i = 0; i < s_timerNodeCount; i++, node++) {
@@ -315,6 +342,9 @@ void Timer_Change(void (*callback)(void), uint32 usec_delay)
 			return;
 		}
 	}
+#if defined(_WIN32)
+	LeaveCriticalSection(&s_timerCriticalSection);
+#endif
 }
 
 /**
@@ -323,6 +353,9 @@ void Timer_Change(void (*callback)(void), uint32 usec_delay)
  */
 void Timer_Remove(void (*callback)(void))
 {
+#if defined(_WIN32)
+	EnterCriticalSection(&s_timerCriticalSection);
+#endif
 	int i;
 	TimerNode *node = s_timerNodes;
 	for (i = 0; i < s_timerNodeCount; i++, node++) {
@@ -331,6 +364,9 @@ void Timer_Remove(void (*callback)(void))
 			return;
 		}
 	}
+#if defined(_WIN32)
+	LeaveCriticalSection(&s_timerCriticalSection);
+#endif
 }
 
 /**
@@ -359,6 +395,11 @@ bool Timer_SetTimer(TimerType timer, bool set)
 	bool ret;
 
 	t = (1 << (timer - 1));
+
+#if defined(_WIN32)
+	EnterCriticalSection(&s_timerCriticalSection);
+#endif
+
 	ret = (s_timersActive & t) != 0;
 
 	if (set) {
@@ -366,6 +407,10 @@ bool Timer_SetTimer(TimerType timer, bool set)
 	} else {
 		s_timersActive &= ~t;
 	}
+
+#if defined(_WIN32)
+	LeaveCriticalSection(&s_timerCriticalSection);
+#endif
 
 	return ret;
 }
