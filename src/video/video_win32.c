@@ -1,10 +1,15 @@
 /** @file src/video/video_win32.c WIN32 video driver. */
 
+#define _WIN32_WINNT 0x0600
+#define WIN32_LEAN_AND_MEAN
+
 #include <stdio.h>
-#define _WIN32_WINNT 0x0500
 #include <windows.h>
 #include <commctrl.h>
+#include <synchapi.h>
 #include <malloc.h>
+#include <stdlib.h>
+
 #include "types.h"
 #include "../os/common.h"
 #include "../os/error.h"
@@ -19,6 +24,7 @@
 
 #include "scalebit.h"
 #include "hqx.h"
+#include "../os/thread.h"
 
 #ifndef MIN
 #ifdef __min
@@ -44,6 +50,8 @@ static uint32 rgb_palette[256];
 
 static const char *s_className = "OpenDUNE";
 static bool s_init = false;
+static bool s_running = false;
+static bool s_done = false;
 static bool s_lock = false;
 static HWND s_hwnd = NULL;
 static HBITMAP s_dib = NULL;
@@ -85,6 +93,14 @@ static uint16 s_mouseMaxY = 0;
 
 static bool s_showFPS = false;
 static bool s_clearWindowBackground = false;
+
+static Thread s_videoThread = NULL;
+static bool s_requestRefresh = false;
+static bool s_requestQuit = false;
+static HANDLE s_videoMainThread;
+static CRITICAL_SECTION s_videoCritSection;
+static CONDITION_VARIABLE s_videoConditionVar;
+static CONDITION_VARIABLE s_videoInitConditionVar;
 
 typedef struct VkMapping {
 	WPARAM  vk;
@@ -249,6 +265,27 @@ static void Video_ToggleFullscreen(void)
 	}
 }
 
+
+#ifdef _DEBUG
+// Help stumble along longer before we deadlock with some
+// heap or other such call on the main thread.
+void DebugFromThread(const char* format, ...) {
+
+	ResumeThread(s_videoMainThread);
+
+	char message[512];
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(message, sizeof(message), format, ap);
+	vfprintf(stdout, format, ap);
+	va_end(ap);
+	OutputDebugString(message);
+
+	SuspendThread(s_videoMainThread);
+}
+#endif
+
 /**
  * Callback wrapper for mouse actions.
  */
@@ -257,6 +294,7 @@ static void Video_Mouse_Callback(void)
 	Mouse_EventHandler(s_mousePosX * SCREEN_WIDTH / s_window_width, s_mousePosY * SCREEN_HEIGHT / s_window_height,
 		               s_mouseButtonLeft, s_mouseButtonRight);
 }
+
 
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
@@ -377,7 +415,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 				} else {
 					double factor_x = (double)SCREEN_WIDTH / (double)s_window_width;
 					double factor_y = (double)SCREEN_HEIGHT / (double)s_window_height;
-					Debug("WM_PAINT StretchBlt (%d,%d,%d,%d) (%d,%d,%d,%d)\n", rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+					DebugFromThread("WM_PAINT StretchBlt (%d,%d,%d,%d) (%d,%d,%d,%d)\n", rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
 						  (int)(rect.left * factor_x), (int)(rect.top * factor_y), (int)(factor_x * (rect.right - rect.left)), (int)(factor_y * (rect.bottom - rect.top)));
 					/* doesn't work well when factor is non integer */
 					StretchBlt(dc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
@@ -601,6 +639,77 @@ static bool Video_AllocateDib(void)
 	return true;
 }
 
+static bool Video_GdiInit(void);
+static void Video_GdiDraw(void);
+static void Video_GdiUnint(void);
+
+static ThreadStatus WINAPI Video_ThreadProc(void* data)
+{
+	VARIABLE_NOT_USED(data);
+
+#ifdef _DEBUG
+	// This requires Windows 10 1607 or later.  Devs can comment it out...
+	SetThreadDescription(GetCurrentThread(), L"GDI Drawing");
+#endif
+
+	const bool ret = Video_GdiInit();
+
+	EnterCriticalSection(&s_videoCritSection);
+
+	if (ret) {
+		s_init = true;
+		s_running = true;
+	}
+	else
+		s_done = true;
+
+	LeaveCriticalSection(&s_videoCritSection);
+
+	WakeConditionVariable(&s_videoInitConditionVar);
+
+	if (!ret)
+		return 1;
+
+	for(;;) {
+		EnterCriticalSection(&s_videoCritSection);
+
+		while(!s_requestQuit && !s_requestRefresh) {
+			SleepConditionVariableCS(&s_videoConditionVar, &s_videoCritSection, INFINITE);
+		}
+
+		s_requestRefresh = false;
+
+		const bool quit = s_requestQuit;
+
+		LeaveCriticalSection(&s_videoCritSection);
+
+		if (quit)
+			break;
+
+		// This is really beyond evil and it is surprising things work
+		// as well as they do, but when playing "we aren't multi-threading"
+		// while running on multiple threads this is probably less bad than
+		// not calling this debug function to suspend the main thread.
+		DWORD suspend_result = SuspendThread(s_videoMainThread);
+
+		Video_GdiDraw();
+
+		ResumeThread(s_videoMainThread);
+	}
+
+	Video_GdiUnint();
+
+	EnterCriticalSection(&s_videoCritSection);
+	s_done = true;
+	s_running = false;
+	LeaveCriticalSection(&s_videoCritSection);
+
+	WakeConditionVariable(&s_videoInitConditionVar);
+
+	return 0;
+}
+
+
 bool Video_Init(int screen_magnification, VideoScaleFilter filter)
 {
 	WNDCLASS wc;
@@ -617,6 +726,8 @@ bool Video_Init(int screen_magnification, VideoScaleFilter filter)
 	if (filter == FILTER_HQX) {
 		hqxInit();
 	}
+
+	DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &s_videoMainThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
 
 	hInstance = GetModuleHandle(NULL);
 
@@ -651,9 +762,32 @@ bool Video_Init(int screen_magnification, VideoScaleFilter filter)
 	}
 #endif /* VIDEO_STATS */
 
+	InitializeConditionVariable(&s_videoInitConditionVar);
+	InitializeConditionVariable(&s_videoConditionVar);
+	InitializeCriticalSection(&s_videoCritSection);
+
+	s_videoThread = Thread_Create(Video_ThreadProc, NULL);
+
+	EnterCriticalSection(&s_videoCritSection);
+
+	while(!s_running && !s_done) {
+		SleepConditionVariableCS(&s_videoInitConditionVar, &s_videoCritSection, INFINITE);
+	}
+
+	const BOOL ok = s_running;
+
+	LeaveCriticalSection(&s_videoCritSection);
+
+	if (!ok)
+		Thread_Wait(s_videoThread, NULL);
+
+	return ok;
+}
+
+static bool Video_GdiInit(void) {
 	if (!Video_AllocateDib()) return false;
 
-	if (filter != FILTER_NEAREST_NEIGHBOR) {
+	if (s_scale_filter != FILTER_NEAREST_NEIGHBOR) {
 #ifdef _MSC_VER
 		/* we need aligned memory for rescale filter */
 		s_screen = _aligned_malloc(SCREEN_WIDTH * SCREEN_HEIGHT, 16);
@@ -661,14 +795,31 @@ bool Video_Init(int screen_magnification, VideoScaleFilter filter)
 		s_screen = malloc(SCREEN_WIDTH * SCREEN_HEIGHT);
 #endif /* _MSC_VER */
 	}
-	s_init = true;
 	return true;
 }
 
+
 void Video_Uninit(void)
 {
-	if (!s_init) return;
+	EnterCriticalSection(&s_videoCritSection);
+	bool init = s_init;
+	if(init)
+		s_requestQuit = true;
+	LeaveCriticalSection(&s_videoCritSection);
 
+	if (!init) return;
+
+	WakeConditionVariable(&s_videoConditionVar);
+
+	Thread_Wait(s_videoThread, NULL);
+
+	DeleteCriticalSection(&s_videoCritSection);
+
+	s_init = false;
+}
+
+static void Video_GdiUnint(void)
+{
 	if (s_dib != NULL) {
 		DeleteObject(s_dib);
 		s_dib = NULL;
@@ -689,7 +840,6 @@ void Video_Uninit(void)
 	if (s_scale_filter == FILTER_HQX) {
 		hqxUnInit();
 	}
-	s_init = false;
 }
 
 #ifdef VIDEO_STATS
@@ -715,14 +865,14 @@ static void Video_Stats(const uint8 * screen)
 	}
 	if(unused_colors != last_unused_colors) {
 		char tmp[20];
-		Debug("Unused colors : %u (used = %u)\n", unused_colors, 256 - unused_colors);
-		Debug("        0123456789ABCDEF\n");
+		DebugFromThread("Unused colors : %u (used = %u)\n", unused_colors, 256 - unused_colors);
+		DebugFromThread("        0123456789ABCDEF\n");
 		last_unused_colors = unused_colors;
 		for(i = 0; i < 256 ; i++) {
 			tmp[i&15] = (freq[i] == 0)?' ':((freq[i] < 10)?'.':((freq[i] < 250)?'o':'O'));
 			if((i&15) == 15) {
 				tmp[16] = '\0';
-				Debug("%3d %02X |%s| %3d\n", i & 0xf0, i & 0xf0, tmp, i);
+				DebugFromThread("%3d %02X |%s| %3d\n", i & 0xf0, i & 0xf0, tmp, i);
 			}
 		}
 	}
@@ -742,13 +892,30 @@ static void Video_Stats(const uint8 * screen)
 		}
 	}
 	if(n_similar_colors > 0 && n_similar_colors != last_n_similar_colors) {
-		Debug("Similar colors = %u\n", n_similar_colors);
+		DebugFromThread("Similar colors = %u\n", n_similar_colors);
 		last_n_similar_colors = n_similar_colors;
 	}
 }
 #endif	/* VIDEO_STATS */
 
 void Video_Tick(void)
+{
+	bool wake = false;
+
+	EnterCriticalSection(&s_videoCritSection);
+
+	if (s_running) {
+		wake = true;
+		s_requestRefresh = true;
+	}
+
+	LeaveCriticalSection(&s_videoCritSection);
+
+	if (wake)
+		WakeConditionVariable(&s_videoConditionVar);
+}
+
+static void Video_GdiDraw(void)
 {
 	MSG msg;
 #ifdef _DEBUG
@@ -830,7 +997,7 @@ void Video_Tick(void)
 		InvalidateRect(s_hwnd, prect, TRUE);
 #ifdef _DEBUG
 		if(s_unchanged > 0) {
-			Debug("Video_Tick() : SCREEN_0 unchanged %d times\n", s_unchanged);
+			DebugFromThread("Video_Tick() : SCREEN_0 unchanged %d times\n", s_unchanged);
 			s_unchanged = 0;
 		}
 #endif /* _DEBUG */
