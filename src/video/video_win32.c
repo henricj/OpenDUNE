@@ -284,6 +284,9 @@ void DebugFromThread(const char* format, ...) {
 
 	SuspendThread(s_videoMainThread);
 }
+#else
+inline void DebugFromThread(const char* format, ...) {
+}
 #endif
 
 /**
